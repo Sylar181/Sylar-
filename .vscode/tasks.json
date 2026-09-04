@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "▶ 启动鸿蒙应用维护工具",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["run", "--project", "HarmonyFileManager.csproj", "--no-restore"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "构建",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["build", "HarmonyFileManager.csproj"],
+      "group": "build",
+      "problemMatcher": ["$msCompile"]
+    }
+  ]
+}

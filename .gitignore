@@ -1,0 +1,26 @@
+# ===== .NET 构建产物 =====
+bin/
+obj/
+publish/
+publish_v2/
+*.user
+*.suo
+
+# ===== 运行时输出与日志 =====
+logs/
+*.log
+
+# ===== 部署/运行目录（含运行时 appsettings 与日志）=====
+鸿蒙文件管理工具/
+
+# ===== 下载与测试数据 =====
+downloads/
+_probe_media_test.txt/
+鸿蒙文件管理工具1_4.zip
+
+# ===== 临时/测试残留文件 =====
+cn_test.txt
+ftp_test.txt
+rm_tmp.txt
+_uploaded_screenshot*.png
+_uploaded_audit.log

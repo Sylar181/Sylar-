@@ -1,0 +1,77 @@
+<Window x:Class="HarmonyFileManager.MediaWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="鸿蒙相册下载工具" Height="680" Width="1080" MinHeight="560" MinWidth="880"
+        Background="#F5F7FB" FontFamily="Microsoft YaHei UI" FontSize="14">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" /><RowDefinition Height="16" /><RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="240" /><ColumnDefinition Width="16" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Row="0" Grid.ColumnSpan="3">
+            <TextBlock Text="鸿蒙相册下载工具" FontSize="24" FontWeight="SemiBold" Foreground="#17233C" />
+            <TextBlock Margin="0,4,0,0" Text="mediatool 特权通道 · 只读下载 · 全程审计" Foreground="#64748B" />
+        </StackPanel>
+
+        <Border Grid.Row="2" Grid.Column="0" Background="White" CornerRadius="10" Padding="16">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Top">
+                    <TextBlock Text="设备" FontSize="16" FontWeight="SemiBold" />
+                    <Button Content="刷新设备" Click="RefreshDevices_Click" HorizontalAlignment="Left" Margin="0,10,0,0" />
+                </StackPanel>
+                <ListBox x:Name="DevicesList" Margin="0,14,0,0" DisplayMemberPath="DisplayName" FontSize="13" />
+            </DockPanel>
+        </Border>
+
+        <Border Grid.Row="2" Grid.Column="2" Background="White" CornerRadius="10" Padding="18">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" /><RowDefinition Height="12" />
+                    <RowDefinition Height="Auto" /><RowDefinition Height="12" />
+                    <RowDefinition Height="*" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="媒体类型" VerticalAlignment="Center" Foreground="#64748B" />
+                    <ComboBox x:Name="TypeSelector" Width="120" Margin="10,0,0,0" SelectionChanged="TypeSelector_SelectionChanged" />
+                    <TextBlock Text="分桶" VerticalAlignment="Center" Foreground="#64748B" Margin="20,0,0,0" />
+                    <ComboBox x:Name="BucketSelector" Width="100" Margin="10,0,0,0" SelectionChanged="BucketSelector_SelectionChanged" />
+                    <Button Content="刷新" Click="RefreshFiles_Click" Margin="16,0,0,0" />
+                </StackPanel>
+
+                <DockPanel Grid.Row="2" LastChildFill="True">
+                    <Button x:Name="BackButton" Content="← 返回" Click="BackButton_Click"
+                            HorizontalAlignment="Left" Margin="0,0,10,0" Padding="10,2"
+                            FontSize="12" Visibility="Collapsed" />
+                    <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                        <StackPanel x:Name="BreadcrumbPanel" Orientation="Horizontal" />
+                    </ScrollViewer>
+                </DockPanel>
+
+                <DataGrid Grid.Row="4" x:Name="FilesGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                          SelectionMode="Extended" CanUserAddRows="False" BorderThickness="0"
+                          FontSize="13" RowHeight="34"
+                          MouseDoubleClick="FilesGrid_MouseDoubleClick"
+                          PreviewMouseLeftButtonDown="FilesGrid_PreviewMouseLeftButtonDown"
+                          PreviewMouseLeftButtonUp="FilesGrid_PreviewMouseLeftButtonUp"
+                          MouseMove="FilesGrid_MouseMove"
+                          PreviewKeyDown="FilesGrid_PreviewKeyDown">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="名称" Binding="{Binding Name}" Width="*" />
+                        <DataGridTextColumn Header="大小" Binding="{Binding SizeDisplay}" Width="110" />
+                        <DataGridTextColumn Header="修改时间" Binding="{Binding ModifiedDisplay}" Width="155" />
+                    </DataGrid.Columns>
+                </DataGrid>
+
+                <StackPanel Grid.Row="5" Margin="0,14,0,0" Orientation="Horizontal">
+                    <Button x:Name="DownloadButton" Content="下载选中" Click="Download_Click" Padding="16,4" />
+                    <TextBlock Text="下载目录:" VerticalAlignment="Center" Foreground="#64748B" FontSize="12" Margin="16,0,6,0" />
+                    <TextBlock x:Name="DownloadFolderText" Text="" VerticalAlignment="Center" Foreground="#17233C" FontSize="12" TextTrimming="CharacterEllipsis" MaxWidth="320" />
+                    <Button Content="更改" Click="ChangeDownloadFolder_Click" Padding="8,2" FontSize="12" Margin="8,0,0,0" />
+                </StackPanel>
+                <TextBlock x:Name="StatusText" Grid.Row="6" Margin="0,8,0,0" Foreground="#64748B" FontSize="12" TextWrapping="Wrap" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
