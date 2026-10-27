@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using HarmonyFileManager.Models;
 
 namespace HarmonyFileManager.Services;
@@ -41,6 +42,33 @@ public sealed class HdcService
         return timeoutSeconds is int timeout
             ? RunAsyncWithTimeout(cancellationToken, timeout, arguments)
             : RunAsync(cancellationToken, arguments);
+    }
+
+    /// <summary>查询设备上指定 bundle 的已安装版本(bm dump -n)。返回 (versionName, versionCode);
+    /// 应用未安装、命令失败或无法解析时返回 null。不依赖 bftpd 沙箱通道,设备在线即可查询。</summary>
+    public async Task<(string VersionName, long VersionCode)?> GetInstalledVersionAsync(string deviceId, string bundleName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = await RunShellAsync(deviceId, $"bm dump -n {bundleName}", cancellationToken, timeoutSeconds: 15);
+            // bm dump 输出为 JSON,取最外层花括号包裹的根对象
+            var start = output.IndexOf('{');
+            var end = output.LastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+            using var document = JsonDocument.Parse(output[start..(end + 1)]);
+            var root = document.RootElement;
+            if (root.TryGetProperty("versionName", out var nameElement)
+                && root.TryGetProperty("versionCode", out var codeElement))
+            {
+                return (nameElement.GetString() ?? string.Empty, codeElement.GetInt64());
+            }
+            return null;
+        }
+        catch
+        {
+            // 设备未安装该应用/权限不足/命令失败,统一视为查不到
+            return null;
+        }
     }
 
     /// <summary>以目标应用身份启动 bftpd FTP 服务(aa process ... -S)。

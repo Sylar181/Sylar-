@@ -151,46 +151,93 @@ public sealed class FtpFileService
     }
 
     /// <summary>下载:设备端 ftpget 拉到设备临时目录,再由 hdc file recv 拉回本机。</summary>
-    /// <summary>下载(Windows 端 FTP RETR)。</summary>
-    public async Task DownloadAsync(string remotePath, string localPath, CancellationToken cancellationToken)
+    public async Task DownloadAsync(string remotePath, string localPath, CancellationToken cancellationToken, IProgress<TransferProgress>? progress = null)
     {
         await AcquireFtpLockAsync(cancellationToken);
         try
         {
-            await DownloadCoreAsync(remotePath, localPath, cancellationToken);
+            await DownloadCoreAsync(remotePath, localPath, cancellationToken, progress, Guid.NewGuid().ToString("N"), 1, 1);
         }
         finally { ReleaseFtpLock(); }
     }
 
-    private async Task DownloadCoreAsync(string remotePath, string localPath, CancellationToken cancellationToken)
+    private async Task DownloadCoreAsync(string remotePath, string localPath, CancellationToken cancellationToken,
+        IProgress<TransferProgress>? progress, string transferId, int fileIndex, int fileCount)
     {
+        transferId = Guid.NewGuid().ToString("N");
         _pathPolicy.EnsureAllowed(_app, remotePath);
         var temp = $"/data/local/tmp/hfm_dl_{Guid.NewGuid():N}.tmp";
+        var destinationDirectory = Path.GetDirectoryName(Path.GetFullPath(localPath))!;
+        var stagingPath = Path.Combine(destinationDirectory, $".hfm_{Guid.NewGuid():N}.partial");
+        var fileName = remotePath[(remotePath.LastIndexOf('/') + 1)..];
         try
         {
-            // 先查远程文件大小(用于下载完整性校验)
+            // 先查远程文件大小(用于下载完整性校验与进度总量)
             var remoteSize = await GetRemoteFileSizeAsync(remotePath, cancellationToken);
-            // 设备端 ftpget 也存在“数据写完但进程不退出”的情况:短超时后直接 file recv(temp 数据通常已完整)
+            var totalWork = remoteSize >= 0 ? remoteSize * 2 : -1;
+            var phase1Bytes = 0L;
+
+            // 大文件允许完整传输,超时后必须校验临时文件再继续。
+            var ftpgetTask = RunDeviceCommandAsync($"ftpget -p {_activePort} -P {_ftp.Password} -u {_ftp.UserName} localhost {Quote(temp)} {DevicePathExpr(remotePath)}", "ftpget", cancellationToken, timeoutSeconds: 180);
+            if (progress is not null)
+            {
+                await PollWhileRunningAsync(ftpgetTask, async () =>
+                {
+                    var size = await GetDeviceFileSizeAsync(temp, cancellationToken);
+                    if (size >= 0) phase1Bytes = size;
+                    ReportTransfer(progress, transferId, "download", fileName, fileIndex, fileCount, phase1Bytes, size >= 0 ? totalWork : -1, "拉取到设备临时目录");
+                }, cancellationToken);
+            }
             try
             {
-                await RunDeviceCommandAsync($"ftpget -p {_activePort} -P {_ftp.Password} -u {_ftp.UserName} localhost {Quote(temp)} {DevicePathExpr(remotePath)}", "ftpget", cancellationToken, timeoutSeconds: 3);
+                await ftpgetTask;
+                phase1Bytes = remoteSize >= 0 ? remoteSize : phase1Bytes;
             }
             catch (TimeoutException)
             {
                 await _audit.WriteAsync("download-retry", remotePath);
                 await ConnectAsync(cancellationToken);
             }
-            await _hdc.ReceiveFileAsync(_deviceId, temp, localPath, cancellationToken);
+
+            var stagedSize = await GetDeviceFileSizeAsync(temp, cancellationToken);
+            if (remoteSize >= 0 && stagedSize != remoteSize)
+                throw new IOException($"设备临时文件不完整或无法校验:{stagedSize}/{remoteSize} 字节");
+            if (remoteSize < 0) remoteSize = stagedSize;
+            phase1Bytes = Math.Max(0, stagedSize);
+            totalWork = remoteSize >= 0 ? remoteSize * 2 : -1;
+
+            // 使用独立临时文件,避免把已有目标文件大小计入本次进度。
+            var recvTask = _hdc.ReceiveFileAsync(_deviceId, temp, stagingPath, cancellationToken);
+            if (progress is not null)
+            {
+                await PollWhileRunningAsync(recvTask, () =>
+                {
+                    var localBytes = File.Exists(stagingPath) ? new FileInfo(stagingPath).Length : 0L;
+                    ReportTransfer(progress, transferId, "download", fileName, fileIndex, fileCount, phase1Bytes + localBytes, totalWork, "拉回本机");
+                    return Task.CompletedTask;
+                }, cancellationToken);
+            }
+            await recvTask;
+
             // 校验本地文件大小与远程一致,避免拿到不完整的下载结果
-            var localSize = new FileInfo(localPath).Length;
+            var localSize = new FileInfo(stagingPath).Length;
             if (remoteSize >= 0 && localSize != remoteSize)
             {
+                ReportTransfer(progress, transferId, "download", fileName, fileIndex, fileCount, phase1Bytes + localSize, totalWork, "拉回本机", "failed");
                 throw new IOException($"下载不完整:{localSize}/{remoteSize} 字节");
             }
+            File.Move(stagingPath, localPath, overwrite: true);
             await _audit.WriteAsync("file-download", $"{remotePath} -> {localPath}");
+            ReportTransfer(progress, transferId, "download", fileName, fileIndex, fileCount, totalWork, totalWork, "完成", "done");
+        }
+        catch (Exception exception)
+        {
+            await _audit.WriteAsync("file-download-failed", $"{remotePath} -> {localPath}: {exception.Message}");
+            throw;
         }
         finally
         {
+            if (File.Exists(stagingPath)) File.Delete(stagingPath);
             try { await _hdc.RunShellAsync(_deviceId, $"rm -f {Quote(temp)}", CancellationToken.None); } catch { /* 忽略 */ }
         }
     }
@@ -219,19 +266,97 @@ public sealed class FtpFileService
         catch { return -1; }
     }
 
+    /// <summary>查询设备端任意路径的文件大小(shell 身份可读 /data/local/tmp 临时文件)。
+    /// 优先 stat -c %s,失败回退 wc -c;两者都不可用时返回 -1。</summary>
+    private async Task<long> GetDeviceFileSizeAsync(string devicePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = await _hdc.RunShellAsync(_deviceId, $"stat -c %s {Quote(devicePath)}", cancellationToken, timeoutSeconds: 5);
+            if (long.TryParse(output.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var statSize)) return statSize;
+        }
+        catch { /* 回退 wc -c */ }
+        try
+        {
+            var output = await _hdc.RunShellAsync(_deviceId, $"wc -c < {Quote(devicePath)}", cancellationToken, timeoutSeconds: 5);
+            if (long.TryParse(output.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var wcSize)) return wcSize;
+        }
+        catch { /* 忽略 */ }
+        return -1;
+    }
+
+    /// <summary>汇报一条传输进度事件(progress 为空时静默跳过)。</summary>
+    private static void ReportTransfer(IProgress<TransferProgress>? progress, string transferId, string direction,
+        string fileName, int fileIndex, int fileCount, long bytesTransferred, long totalBytes, string stage, string state = "running")
+    {
+        progress?.Report(new TransferProgress
+        {
+            TransferId = transferId,
+            Direction = direction,
+            FileName = fileName,
+            BytesTransferred = totalBytes >= 0 ? Math.Clamp(bytesTransferred, 0, totalBytes) : Math.Max(0, bytesTransferred),
+            TotalBytes = totalBytes,
+            FileIndex = fileIndex,
+            FileCount = fileCount,
+            Stage = stage,
+            State = state
+        });
+    }
+
+    /// <summary>在传输任务运行期间周期性执行轮询(读临时文件大小并汇报进度),直到任务完成。</summary>
+    private static async Task PollWhileRunningAsync(Task transferTask, Func<Task> pollAsync, CancellationToken cancellationToken, int intervalMs = 250)
+    {
+        while (!transferTask.IsCompleted)
+        {
+            try { await pollAsync(); }
+            catch { /* 忽略单次轮询失败 */ }
+            try { await Task.Delay(intervalMs, cancellationToken); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    /// <summary>递归统计远程目录内所有文件的总字节数与文件数(只读列表,供 UI 预知批量下载总量)。</summary>
+    public async Task<(long TotalBytes, int FileCount)> GetDirectoryTotalSizeAsync(string remoteDir, CancellationToken cancellationToken)
+    {
+        long total = 0;
+        var count = 0;
+        await SumDirectoryAsync(remoteDir, cancellationToken);
+        return (total, count);
+
+        async Task SumDirectoryAsync(string dir, CancellationToken ct)
+        {
+            _pathPolicy.EnsureAllowed(_app, dir);
+            var items = await ListFilesCoreAsync(dir, ct);
+            foreach (var item in items)
+            {
+                if (item.Type == "directory")
+                {
+                    await SumDirectoryAsync(item.Path, ct);
+                }
+                else
+                {
+                    if (item.Size is not long size) throw new IOException($"无法统计文件大小: {item.Path}");
+                    total = checked(total + size);
+                    count++;
+                }
+            }
+        }
+    }
+
     /// <summary>递归下载远程目录到本地目录(自动建本地目录结构)。持锁一次,内部递归全部走无锁版本。</summary>
-    public async Task DownloadFolderAsync(string remoteDir, string localDir, CancellationToken cancellationToken)
+    public async Task DownloadFolderAsync(string remoteDir, string localDir, CancellationToken cancellationToken, IProgress<TransferProgress>? progress = null)
     {
         await AcquireFtpLockAsync(cancellationToken);
         try
         {
-            await DownloadFolderCoreAsync(remoteDir, localDir, cancellationToken);
+            await DownloadFolderCoreAsync(remoteDir, localDir, cancellationToken, progress, Guid.NewGuid().ToString("N"));
             await _audit.WriteAsync("folder-download", $"{remoteDir} -> {localDir}");
         }
         finally { ReleaseFtpLock(); }
     }
 
-    private async Task DownloadFolderCoreAsync(string remoteDir, string localDir, CancellationToken cancellationToken)
+    private async Task DownloadFolderCoreAsync(string remoteDir, string localDir, CancellationToken cancellationToken,
+        IProgress<TransferProgress>? progress, string transferId)
     {
         _pathPolicy.EnsureAllowed(_app, remoteDir);
         Directory.CreateDirectory(localDir);
@@ -241,11 +366,11 @@ public sealed class FtpFileService
             var localPath = Path.Combine(localDir, SanitizeFileName(item.Name));
             if (item.Type == "directory")
             {
-                await DownloadFolderCoreAsync(item.Path, localPath, cancellationToken);
+                await DownloadFolderCoreAsync(item.Path, localPath, cancellationToken, progress, transferId);
             }
             else
             {
-                await DownloadCoreAsync(item.Path, localPath, cancellationToken);
+                await DownloadCoreAsync(item.Path, localPath, cancellationToken, progress, transferId, 0, 0);
             }
         }
     }
@@ -257,42 +382,61 @@ public sealed class FtpFileService
     }
 
     /// <summary>上传(Windows 端 FTP STOR),不依赖设备端 ftpput。</summary>
-    public async Task UploadAsync(string localPath, string remotePath, CancellationToken cancellationToken)
+    public async Task UploadAsync(string localPath, string remotePath, CancellationToken cancellationToken, IProgress<TransferProgress>? progress = null)
     {
         await AcquireFtpLockAsync(cancellationToken);
         try
         {
-            await UploadCoreAsync(localPath, remotePath, cancellationToken);
+            await UploadCoreAsync(localPath, remotePath, cancellationToken, progress, Guid.NewGuid().ToString("N"), 1, 1);
         }
         finally { ReleaseFtpLock(); }
     }
 
-    private async Task UploadCoreAsync(string localPath, string remotePath, CancellationToken cancellationToken)
+    private async Task UploadCoreAsync(string localPath, string remotePath, CancellationToken cancellationToken,
+        IProgress<TransferProgress>? progress, string transferId, int fileIndex, int fileCount)
     {
+        transferId = Guid.NewGuid().ToString("N");
         _pathPolicy.EnsureAllowed(_app, remotePath);
         var temp = $"/data/local/tmp/hfm_up_{Guid.NewGuid():N}.tmp";
         var localSize = new FileInfo(localPath).Length;
+        var fileName = Path.GetFileName(localPath);
+        var totalWork = localSize * 2;
         try
         {
-            await _hdc.SendFileAsync(_deviceId, localPath, temp, cancellationToken);
+            // 阶段1:hdc file send 本机 -> 设备临时目录
+            var sendTask = _hdc.SendFileAsync(_deviceId, localPath, temp, cancellationToken);
+            if (progress is not null)
+            {
+                await PollWhileRunningAsync(sendTask, async () =>
+                {
+                    var size = await GetDeviceFileSizeAsync(temp, cancellationToken);
+                    ReportTransfer(progress, transferId, "upload", fileName, fileIndex, fileCount, Math.Max(0, size), size >= 0 ? totalWork : -1, "推送到设备临时目录");
+                }, cancellationToken);
+            }
+            await sendTask;
+            var phase1Bytes = localSize; // send 完成后设备临时文件即等于本地文件大小
+
             // 设备端 ftpput 传输不可靠:可能中途卡死或写完后进程不退出,且会污染 bftpd。
             // 策略:后台启动 ftpput(长超时不中断),轮询目标文件大小;检测到“卡住”(大小长时间不变或校验挂起)即重连到新 bftpd 重试,最多 3 次。
             var complete = false;
             Task<string>? ftpputTask = null;
             for (var attempt = 0; attempt < 3 && !complete; attempt++)
             {
+                var initialSize = await GetRemoteFileSizeAsync(remotePath, cancellationToken);
+                var observedWrite = initialSize != localSize;
+                ReportTransfer(progress, transferId, "upload", fileName, fileIndex, fileCount, phase1Bytes, totalWork, attempt == 0 ? "写入沙箱" : "重试写入沙箱");
                 ftpputTask = RunDeviceCommandAsync($"ftpput -s -p {_activePort} -P {_ftp.Password} -u {_ftp.UserName} localhost {Quote(temp)} {DevicePathExpr(remotePath)}", "ftpput", cancellationToken, timeoutSeconds: 180);
                 var lastSize = -2L;
                 var stagnantRounds = 0;
                 for (var i = 0; i < 90; i++)
                 {
-                    if (ftpputTask.IsCompleted && !complete)
-                    {
-                        try { await ftpputTask; } catch { /* 记录原始错误 */ }
-                        break;
-                    }
+                    var commandCompleted = ftpputTask.IsCompleted;
+                    if (commandCompleted) await ftpputTask;
                     var size = await GetRemoteFileSizeAsync(remotePath, cancellationToken);
-                    if (size == localSize)
+                    if (size >= 0 && size != initialSize) observedWrite = true;
+                    var measuredSize = observedWrite || commandCompleted ? Math.Max(0, size) : 0;
+                    ReportTransfer(progress, transferId, "upload", fileName, fileIndex, fileCount, phase1Bytes + measuredSize, size >= 0 ? totalWork : -1, "写入沙箱");
+                    if (size == localSize && (observedWrite || commandCompleted))
                     {
                         // 双重确认:等 300ms 再查一次,避免读到瞬时/缓存值(未完全落盘)
                         await Task.Delay(300, cancellationToken);
@@ -302,6 +446,7 @@ public sealed class FtpFileService
                             break;
                         }
                     }
+                    if (commandCompleted) break;
                     if (size == lastSize) stagnantRounds++;
                     else { lastSize = size; stagnantRounds = 0; }
                     if (stagnantRounds >= 10) break; // 大小约 3 秒无变化:传输卡住,重连重试
@@ -314,11 +459,21 @@ public sealed class FtpFileService
                     await ConnectAsync(cancellationToken); // 杀掉卡住的 ftpput 并切换到全新 bftpd
                 }
             }
-            if (!complete) throw new IOException($"上传未完成:目标文件大小不完整({remotePath})");
+            if (!complete)
+            {
+                ReportTransfer(progress, transferId, "upload", fileName, fileIndex, fileCount, phase1Bytes, totalWork, "写入沙箱", "failed");
+                throw new IOException($"上传未完成:目标文件大小不完整({remotePath})");
+            }
             // 上传成功:仅后台清理可能挂起的 ftpput 进程(已实测正常完成的 ftpput 不污染 bftpd,
             // 无需强制重连;只有卡住/失败时才 ConnectAsync 换干净 bftpd,大幅减少每次上传的重连开销)
             if (ftpputTask != null) _ = ObserveQuietlyAsync(ftpputTask);
             await _audit.WriteAsync("file-upload", $"{localPath} -> {remotePath}");
+            ReportTransfer(progress, transferId, "upload", fileName, fileIndex, fileCount, totalWork, totalWork, "完成", "done");
+        }
+        catch (Exception exception)
+        {
+            await _audit.WriteAsync("file-upload-failed", $"{localPath} -> {remotePath}: {exception.Message}");
+            throw;
         }
         finally
         {
@@ -385,28 +540,29 @@ public sealed class FtpFileService
            || message.Contains("exist", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>递归上传本地文件夹到远程目录(自动逐级建目录)。持锁一次,内部递归全部走无锁版本。</summary>
-    public async Task UploadFolderAsync(string localDir, string remoteDir, CancellationToken cancellationToken)
+    public async Task UploadFolderAsync(string localDir, string remoteDir, CancellationToken cancellationToken, IProgress<TransferProgress>? progress = null)
     {
         await AcquireFtpLockAsync(cancellationToken);
         try
         {
-            await UploadFolderCoreAsync(localDir, remoteDir, cancellationToken);
+            await UploadFolderCoreAsync(localDir, remoteDir, cancellationToken, progress, Guid.NewGuid().ToString("N"));
             await _audit.WriteAsync("folder-upload", $"{localDir} -> {remoteDir}");
         }
         finally { ReleaseFtpLock(); }
     }
 
-    private async Task UploadFolderCoreAsync(string localDir, string remoteDir, CancellationToken cancellationToken)
+    private async Task UploadFolderCoreAsync(string localDir, string remoteDir, CancellationToken cancellationToken,
+        IProgress<TransferProgress>? progress, string transferId)
     {
         _pathPolicy.EnsureAllowed(_app, remoteDir);
         await EnsureRemoteDirectoryCoreAsync(remoteDir, cancellationToken);
         foreach (var file in Directory.GetFiles(localDir))
         {
-            await UploadCoreAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", cancellationToken);
+            await UploadCoreAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", cancellationToken, progress, transferId, 0, 0);
         }
         foreach (var subDir in Directory.GetDirectories(localDir))
         {
-            await UploadFolderCoreAsync(subDir, $"{remoteDir}/{Path.GetFileName(subDir)}", cancellationToken);
+            await UploadFolderCoreAsync(subDir, $"{remoteDir}/{Path.GetFileName(subDir)}", cancellationToken, progress, transferId);
         }
     }
 

@@ -52,7 +52,7 @@
                 <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="50" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock x:Name="PolicyNameText" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center" />
-                    <TextBlock Margin="12,3,0,0" Text="由设备端 bftpd 受控通道提供" Foreground="#64748B" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppVersionText" Margin="12,4,0,0" FontSize="13" Foreground="#64748B" VerticalAlignment="Center" />
                 </StackPanel>
                 <Grid Grid.Row="1" Margin="0,12,0,4">
                     <Grid.ColumnDefinitions><ColumnDefinition Width="150" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
@@ -85,7 +85,13 @@
                         <Button x:Name="RenameButton" Content="重命名" Click="Rename_Click" Margin="8,0,0,0" />
                         <Button x:Name="DeleteButton" Content="删除" Background="#C62828" Click="Delete_Click" Margin="8,0,0,0" />
                     </StackPanel>
-                    <TextBlock x:Name="StatusText" Grid.Row="2" Margin="0,10,0,0" Foreground="#64748B" FontSize="13" TextWrapping="Wrap" />
+                    <StackPanel Grid.Row="2" Margin="0,10,0,0">
+                        <StackPanel x:Name="TransferPanel" Visibility="Collapsed">
+                            <ProgressBar x:Name="TransferProgress" Height="6" IsIndeterminate="False" Minimum="0" Maximum="100" />
+                            <TextBlock x:Name="TransferInfoText" Margin="0,6,0,0" Foreground="#334155" FontSize="13" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <TextBlock x:Name="StatusText" Foreground="#64748B" FontSize="13" TextWrapping="Wrap" />
+                    </StackPanel>
                 </Grid>
             </Grid>
         </Border>

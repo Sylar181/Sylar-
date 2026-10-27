@@ -70,7 +70,13 @@
                     <TextBlock x:Name="DownloadFolderText" Text="" VerticalAlignment="Center" Foreground="#17233C" FontSize="12" TextTrimming="CharacterEllipsis" MaxWidth="320" />
                     <Button Content="更改" Click="ChangeDownloadFolder_Click" Padding="8,2" FontSize="12" Margin="8,0,0,0" />
                 </StackPanel>
-                <TextBlock x:Name="StatusText" Grid.Row="6" Margin="0,8,0,0" Foreground="#64748B" FontSize="12" TextWrapping="Wrap" />
+                <StackPanel Grid.Row="6" Margin="0,8,0,0">
+                    <StackPanel x:Name="TransferPanel" Visibility="Collapsed">
+                        <ProgressBar x:Name="DownloadProgress" Height="6" Minimum="0" Maximum="100" />
+                        <TextBlock x:Name="ProgressInfoText" Margin="0,6,0,6" FontSize="12" TextWrapping="Wrap" Foreground="#334155" />
+                    </StackPanel>
+                    <TextBlock x:Name="StatusText" Foreground="#64748B" FontSize="12" TextWrapping="Wrap" />
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>
