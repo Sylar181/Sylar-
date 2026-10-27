@@ -8,6 +8,7 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
     <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
     <Resource Include="app.ico" />
   </ItemGroup>

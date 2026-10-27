@@ -31,6 +31,8 @@ public partial class MainWindow : Window
     private bool _isDragging;
     private bool _installingPackage; // 防止重复拖入/点击造成并发安装
     private readonly string _dragSaveFolder = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+    private readonly TransferProgressTracker _transferTracker = new();
+    private bool _transferActive;
 
     public MainWindow()
     {
@@ -43,6 +45,7 @@ public partial class MainWindow : Window
         if (!string.IsNullOrEmpty(resolvedHdc)) PersistHdcPath(resolvedHdc);
         Loaded += OnLoadedEnsureHdc;
         PolicyNameText.Text = $"{_configuration.ManagedApplication.DisplayName}  ·  {_configuration.ManagedApplication.BundleName}";
+        AppVersionText.Text = "";
         RootSelector.ItemsSource = _configuration.ManagedApplication.AllowedRoots.Keys.ToList();
         RootSelector.SelectedIndex = 0;
         SetFtpState(connected: false);
@@ -64,6 +67,7 @@ public partial class MainWindow : Window
     /// <summary>打开 HDC 引导窗口;成功后重建 HdcService 并刷新设备,把新路径写回 appsettings.json。</summary>
     private async void OpenHdcSetup()
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         var setup = new HdcSetupWindow(_configuration.HdcInstall);
         if (setup.ShowDialog() != true) return;
         var path = setup.SelectedHdcPath;
@@ -155,6 +159,22 @@ public partial class MainWindow : Window
         return devices.Select(d => d with { ChannelReady = d.Id == connectedId }).ToList();
     }
 
+    /// <summary>查询并显示设备上晶核的已安装版本(bm dump,不依赖沙箱通道)。
+    /// 显示失败原因:未连接设备/查询不到时提示。</summary>
+    private async Task RefreshAppVersionAsync()
+    {
+        if (!_hdc.IsAvailable || _ftp?.IsConnected != true)
+        {
+            AppVersionText.Text = string.Empty;
+            return;
+        }
+        var bundle = _configuration.ManagedApplication.BundleName;
+        var version = await _hdc.GetInstalledVersionAsync(_ftp.DeviceId, bundle, CancellationToken.None);
+        AppVersionText.Text = version is { } v
+            ? $"游戏版本 {v.VersionName}（{v.VersionCode}）"
+            : "未查询到版本（可能未安装）";
+    }
+
     /// <summary>保持当前选中项,把设备列表红/绿点同步为当前连接状态(连接建立/失败/设备丢失后调用)。</summary>
     private void SyncChannelState()
     {
@@ -177,12 +197,14 @@ public partial class MainWindow : Window
             await _ftp.ConnectAsync(CancellationToken.None);
             SetFtpState(connected: true);
             SyncChannelState(); // 绿点:该设备通道已就绪
+            await RefreshAppVersionAsync(); // 连接成功后显示设备上晶核版本
             await LoadFilesAsync();
         }
         catch (Exception exception)
         {
             _ftp = null;
             SetFtpState(connected: false);
+            AppVersionText.Text = string.Empty;
             SyncChannelState(); // 红点:通道未建立
             StatusText.Text = quiet ? $"自动连接失败：{exception.Message}" : $"连接失败：{exception.Message}";
             await _auditService.WriteAsync("ftp-connect-failed", exception.Message);
@@ -311,21 +333,26 @@ public partial class MainWindow : Window
     /// <summary>把选中的设备文件先下载到本地临时缓存,再以 FileDrop 格式拖出到桌面/资源管理器。</summary>
     private async Task PrepareDragFilesAsync(IReadOnlyList<MaintenanceFileItem> items)
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         _isDragging = true;
         try
         {
             SetSelectedRowsOpacity(0.45); // 拖起时的选中状态反馈
             var saveFolder = _dragSaveFolder;
+            if (!ConfirmDownloadOverwrite(items.Select(item => Path.Combine(saveFolder, SanitizeFileName(item.Name))))) return;
             StatusText.Text = $"正在下载 {items.Count} 个文件到 {saveFolder}…";
+            var totalWork = items.Any(item => item.Size is null) ? -1 : items.Sum(item => item.Size!.Value * 2);
+            ShowTransferProgress(totalWork);
+            var progress = new InlineTransferProgress(OnTransferProgress);
             var success = 0;
             using var semaphore = new SemaphoreSlim(4);
-            await Task.WhenAll(items.Select(async item =>
+            await Task.WhenAll(items.Select(async (item, i) =>
             {
                 await semaphore.WaitAsync();
                 try
                 {
                     var localPath = Path.Combine(saveFolder, SanitizeFileName(item.Name));
-                    await _ftp!.DownloadAsync(item.Path, localPath, CancellationToken.None);
+                    await _ftp!.DownloadAsync(item.Path, localPath, CancellationToken.None, new BatchProgress(progress, i + 1, items.Count));
                     Interlocked.Increment(ref success);
                 }
                 finally { semaphore.Release(); }
@@ -339,6 +366,7 @@ public partial class MainWindow : Window
         }
         finally
         {
+            HideTransferProgress();
             SetSelectedRowsOpacity(1.0);
             _isDragging = false;
             _draggingStarted = false;
@@ -357,6 +385,14 @@ public partial class MainWindow : Window
         }
     }
 
+    private bool ConfirmDownloadOverwrite(IEnumerable<string> destinations)
+    {
+        var existing = destinations.Where(path => File.Exists(path) || Directory.Exists(path)).ToList();
+        return existing.Count == 0 || MessageBox.Show(this,
+            $"以下本地目标已存在，继续下载可能覆盖同名文件：\n{string.Join("\n", existing)}\n\n是否继续？",
+            "确认下载覆盖", MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK;
+    }
+
     private static string SanitizeFileName(string name)
     {
         foreach (var invalid in Path.GetInvalidFileNameChars()) name = name.Replace(invalid, '_');
@@ -371,6 +407,7 @@ public partial class MainWindow : Window
 
     private async void FilesGrid_Drop(object sender, DragEventArgs e)
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         e.Handled = true;
         if (_ftp == null)
         {
@@ -394,15 +431,21 @@ public partial class MainWindow : Window
         try
         {
             StatusText.Text = $"正在上传 {files.Count} 项…";
-            foreach (var file in files)
+            var sizes = files.Select(file => Directory.Exists(file) ? GetLocalDirectoryTotalSize(file) : new FileInfo(file).Length).ToList();
+            var totalWork = sizes.Any(size => size < 0) ? -1 : sizes.Sum() * 2;
+            ShowTransferProgress(totalWork);
+            var progress = new InlineTransferProgress(OnTransferProgress);
+            for (var i = 0; i < files.Count; i++)
             {
+                var file = files[i];
+                var wrapped = new BatchProgress(progress, i + 1, files.Count);
                 if (Directory.Exists(file))
                 {
-                    await _ftp.UploadFolderAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", CancellationToken.None);
+                    await _ftp.UploadFolderAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", CancellationToken.None, wrapped);
                 }
                 else
                 {
-                    await _ftp.UploadAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", CancellationToken.None);
+                    await _ftp.UploadAsync(file, $"{remoteDir}/{Path.GetFileName(file)}", CancellationToken.None, wrapped);
                 }
             }
             await _auditService.WriteAsync("file-drag-in", string.Join(";", files));
@@ -411,12 +454,14 @@ public partial class MainWindow : Window
         catch (Exception exception) { StatusText.Text = $"上传失败：{exception.Message}"; await _auditService.WriteAsync("upload-failed", exception.Message); }
         finally
         {
+            HideTransferProgress();
             await LoadFilesAsync(); // 无论成功失败,刷新界面反映实际状态
         }
     }
 
     private async void Download_Click(object sender, RoutedEventArgs e)
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         if (_ftp == null)
         {
             StatusText.Text = "请先连接设备。";
@@ -432,25 +477,52 @@ public partial class MainWindow : Window
         var dialog = new Microsoft.Win32.OpenFolderDialog { Title = $"选择保存目录（{selected.Count} 项）" };
         if (dialog.ShowDialog(this) != true) return;
         var folder = dialog.FolderName;
+        if (!ConfirmDownloadOverwrite(selected.Select(item => Path.Combine(folder, SanitizeFileName(item.Name))))) return;
 
         var success = 0;
         var failures = new List<string>();
+        ShowTransferProgress(-1);
+        StatusText.Text = "正在统计下载文件总量…";
         try
         {
+            // 预统计总工作量(文件用列表大小,文件夹递归统计);统计失败按 0 计
+            long totalWork = 0;
+            var totalKnown = true;
+            foreach (var item in selected)
+            {
+                try
+                {
+                    if (item.Type == "directory")
+                    {
+                        var (dirBytes, _) = await _ftp.GetDirectoryTotalSizeAsync(item.Path, CancellationToken.None);
+                        totalWork += dirBytes * 2;
+                    }
+                    else
+                    {
+                        if (item.Size is null) totalKnown = false;
+                        totalWork += (item.Size ?? 0L) * 2;
+                    }
+                }
+                catch { totalKnown = false; }
+            }
+            ShowTransferProgress(totalKnown ? totalWork : -1);
+            var progress = new InlineTransferProgress(OnTransferProgress);
+
             for (var i = 0; i < selected.Count; i++)
             {
                 var item = selected[i];
                 StatusText.Text = $"正在下载 {i + 1}/{selected.Count}: {item.Name}…";
+                var wrapped = new BatchProgress(progress, i + 1, selected.Count);
                 try
                 {
                     var localPath = Path.Combine(folder, SanitizeFileName(item.Name));
                     if (item.Type == "directory")
                     {
-                        await _ftp.DownloadFolderAsync(item.Path, localPath, CancellationToken.None);
+                        await _ftp.DownloadFolderAsync(item.Path, localPath, CancellationToken.None, wrapped);
                     }
                     else
                     {
-                        await _ftp.DownloadAsync(item.Path, localPath, CancellationToken.None);
+                        await _ftp.DownloadAsync(item.Path, localPath, CancellationToken.None, wrapped);
                     }
                     success++;
                 }
@@ -465,10 +537,12 @@ public partial class MainWindow : Window
             await _auditService.WriteAsync("download-batch", $"{success}/{selected.Count} 成功; {string.Join(";", failures.Take(3))}");
         }
         catch (Exception exception) { StatusText.Text = $"下载失败：{exception.Message}（已完成 {success}/{selected.Count}）。"; }
+        finally { HideTransferProgress(); }
     }
 
     private async void Upload_Click(object sender, RoutedEventArgs e)
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         if (_ftp == null)
         {
             StatusText.Text = "请先连接设备。";
@@ -485,13 +559,17 @@ public partial class MainWindow : Window
 
         try
         {
+            var localSize = new FileInfo(dialog.FileName).Length;
+            ShowTransferProgress(localSize * 2);
+            var progress = new InlineTransferProgress(OnTransferProgress);
             StatusText.Text = $"正在上传 {fileName} …";
-            await _ftp.UploadAsync(dialog.FileName, remotePath, CancellationToken.None);
+            await _ftp.UploadAsync(dialog.FileName, remotePath, CancellationToken.None, progress);
             StatusText.Text = $"已上传 {fileName}。";
         }
         catch (Exception exception) { StatusText.Text = $"上传失败：{exception.Message}"; }
         finally
         {
+            HideTransferProgress();
             await LoadFilesAsync(); // 无论成功失败,刷新界面反映实际状态
         }
     }
@@ -520,6 +598,7 @@ public partial class MainWindow : Window
 
     private async Task DeleteSelectedAsync()
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         if (_ftp == null)
         {
             StatusText.Text = "请先连接设备。";
@@ -600,6 +679,7 @@ public partial class MainWindow : Window
     /// 安装命令无回显,期间用进度条+心跳文本反馈仍在正常执行,避免看起来像卡死。</summary>
     private async Task InstallPackagesAsync(IReadOnlyList<string> packagePaths)
     {
+        if (_transferActive) { StatusText.Text = "请等待当前文件传输结束。"; return; }
         if (_installingPackage)
         {
             StatusText.Text = "已有安装任务进行中，请稍候…";
@@ -654,6 +734,7 @@ public partial class MainWindow : Window
             StatusText.Text = failures.Count == 0
                 ? $"安装完成：{success}/{packagePaths.Count} 个安装包已安装到 {device.DisplayName}。"
                 : $"安装完成 {success}/{packagePaths.Count}，失败 {failures.Count} 项：{string.Join("；", failures.Take(2))}…";
+            await RefreshAppVersionAsync(); // 安装/覆盖后刷新设备上的版本显示
         }
         finally
         {
@@ -788,6 +869,7 @@ public partial class MainWindow : Window
                     var lostDevice = _ftp.DeviceId;
                     _ftp = null;
                     SetFtpState(connected: false);
+                    AppVersionText.Text = string.Empty;
                     DevicesList.ItemsSource = MapChannelState(devices); // 红点:通道已失效
                     StatusText.Text = "设备已断开,请重新连接。";
                     await _auditService.WriteAsync("device-lost", lostDevice);
@@ -832,6 +914,86 @@ public partial class MainWindow : Window
         UploadButton.IsEnabled = connected;
         RenameButton.IsEnabled = connected;
         DeleteButton.IsEnabled = connected;
+    }
+
+    // ---------- 传输进度 UI ----------
+
+    /// <summary>为批量传输中的每个文件标注顶层序号/总数(覆盖服务层文件夹递归时的 0/0)。</summary>
+    private sealed class InlineTransferProgress(Action<TransferProgress> report) : IProgress<TransferProgress>
+    {
+        public void Report(TransferProgress value) => report(value);
+    }
+
+    private sealed class BatchProgress : IProgress<TransferProgress>
+    {
+        private readonly IProgress<TransferProgress> _inner;
+        private readonly int _index;
+        private readonly int _count;
+
+        public BatchProgress(IProgress<TransferProgress> inner, int index, int count)
+        {
+            _inner = inner;
+            _index = index;
+            _count = count;
+        }
+
+        public void Report(TransferProgress value) => _inner.Report(value with { FileIndex = _index, FileCount = _count });
+    }
+
+    private void ShowTransferProgress(long totalWork)
+    {
+        _transferActive = true;
+        DownloadButton.IsEnabled = UploadButton.IsEnabled = DeleteButton.IsEnabled = false;
+        _transferTracker.Reset(totalWork);
+        TransferPanel.Visibility = Visibility.Visible;
+        TransferProgress.IsIndeterminate = totalWork < 0;
+        TransferProgress.Value = 0;
+        TransferInfoText.Text = string.Empty;
+    }
+
+    private void HideTransferProgress()
+    {
+        _transferActive = false;
+        SetFtpState(_ftp?.IsConnected == true);
+        TransferPanel.Visibility = Visibility.Collapsed;
+        TransferProgress.IsIndeterminate = false;
+    }
+
+    private void OnTransferProgress(TransferProgress e)
+    {
+        if (!_transferActive) return;
+        _transferTracker.Update(e);
+        TransferProgress.IsIndeterminate = _transferTracker.TotalWork < 0 || e.TotalBytes < 0;
+        TransferProgress.Value = _transferTracker.Percent;
+
+        var position = e.FileIndex > 0 && e.FileCount > 0 ? $"[{e.FileIndex}/{e.FileCount}] " : string.Empty;
+        var percent = !TransferProgress.IsIndeterminate && _transferTracker.TotalWork > 0 ? $"（{_transferTracker.Percent:0.#}%）" : string.Empty;
+        var parts = new List<string>
+        {
+            $"{position}{e.FileName}",
+            $"等效进度 {FormatSize(_transferTracker.DoneActualBytes)} / {(_transferTracker.TotalWork < 0 ? "未知" : FormatSize(_transferTracker.TotalActualBytes))}{percent}",
+            e.Stage
+        };
+        var speed = TransferProgress.IsIndeterminate ? string.Empty : _transferTracker.SpeedText;
+        if (!string.IsNullOrEmpty(speed)) parts.Add(speed);
+        var eta = TransferProgress.IsIndeterminate ? string.Empty : _transferTracker.EtaText;
+        if (!string.IsNullOrEmpty(eta)) parts.Add(eta);
+        TransferInfoText.Text = string.Join(" · ", parts);
+    }
+
+    /// <summary>递归统计本地目录内所有文件的总字节数(用于上传总量预知)。</summary>
+    private static long GetLocalDirectoryTotalSize(string dir)
+    {
+        long total = 0;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                total += new FileInfo(file).Length;
+            }
+        }
+        catch { return -1; }
+        return total;
     }
 
     private static ToolConfiguration LoadConfiguration()

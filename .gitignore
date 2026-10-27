@@ -3,6 +3,10 @@ bin/
 obj/
 publish/
 publish_v2/
+publish_v3/
+publish_v4/
+鸿蒙文件管理工具1_6.zip
+鸿蒙文件管理工具1_5.zip
 *.user
 *.suo
 

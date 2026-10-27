@@ -18,6 +18,8 @@ public partial class MediaWindow : Window
     private string _currentType = string.Empty;
     private string _currentBucket = string.Empty;
     private bool _refreshing;
+    private bool _downloading;
+    private readonly TransferProgressTracker _progressTracker = new();
     private string _downloadFolder = string.Empty;
 
     public MediaWindow(HdcService hdc, AuditService audit, MediaAccessOptions config)
@@ -44,6 +46,7 @@ public partial class MediaWindow : Window
 
     private async Task RefreshDevicesAsync(bool quiet)
     {
+        if (_downloading) return;
         if (!_hdc.IsAvailable)
         {
             if (!quiet) StatusText.Text = "未找到 hdc.exe，请先在主窗口完成「HDC 设置」。";
@@ -196,7 +199,7 @@ public partial class MediaWindow : Window
 
     private async void FilesGrid_MouseMove(object sender, MouseEventArgs e)
     {
-        if (e.LeftButton != MouseButtonState.Pressed || _draggingStarted || _media == null) return;
+        if (_downloading || e.LeftButton != MouseButtonState.Pressed || _draggingStarted || _media == null) return;
         var position = e.GetPosition(FilesGrid);
         if (Math.Abs(position.X - _dragStartPoint.X) < SystemParameters.MinimumHorizontalDragDistance
             && Math.Abs(position.Y - _dragStartPoint.Y) < SystemParameters.MinimumVerticalDragDistance) return;
@@ -210,6 +213,8 @@ public partial class MediaWindow : Window
         {
             StatusText.Text = $"正在准备拖拽下载 {items.Count} 个文件…";
             Directory.CreateDirectory(tempFolder);
+            var service = _media!;
+            var progress = BeginDownload(items);
             var localPaths = new List<string>();
             var success = 0;
             using var semaphore = new SemaphoreSlim(4);
@@ -219,7 +224,7 @@ public partial class MediaWindow : Window
                 try
                 {
                     var localPath = Path.Combine(tempFolder, SanitizeFileName(item.Name));
-                    await _media.DownloadAsync(item.Path, localPath, CancellationToken.None);
+                    await service.DownloadAsync(item.Path, localPath, CancellationToken.None, progress, item.Size);
                     lock (localPaths) localPaths.Add(localPath);
                     Interlocked.Increment(ref success);
                 }
@@ -244,6 +249,7 @@ public partial class MediaWindow : Window
         }
         finally
         {
+            EndDownload();
             _draggingStarted = false;
             try { Directory.Delete(tempFolder, true); } catch { /* 拖拽中文件被占用时忽略 */ }
         }
@@ -253,6 +259,7 @@ public partial class MediaWindow : Window
 
     private async void Download_Click(object sender, RoutedEventArgs e)
     {
+        if (_downloading) return;
         if (_media == null) { StatusText.Text = "请先连接设备。"; return; }
         var selected = FilesGrid.SelectedItems.OfType<MediaItem>().Where(i => i.Type == "file").ToList();
         if (selected.Count == 0)
@@ -262,12 +269,19 @@ public partial class MediaWindow : Window
         }
 
         var folder = _downloadFolder;
-        Directory.CreateDirectory(folder);
+        var existing = selected.Select(item => Path.Combine(folder, SanitizeFileName(item.Name)))
+            .Where(File.Exists).ToList();
+        if (existing.Count > 0 && MessageBox.Show(this,
+            $"下载将覆盖 {existing.Count} 个本地同名文件，是否继续？", "确认覆盖",
+            MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        var service = _media;
+        var progress = BeginDownload(selected);
 
         var success = 0;
         var failures = new List<string>();
         try
         {
+            Directory.CreateDirectory(folder);
             for (var i = 0; i < selected.Count; i++)
             {
                 var item = selected[i];
@@ -275,7 +289,7 @@ public partial class MediaWindow : Window
                 try
                 {
                     var localPath = Path.Combine(folder, SanitizeFileName(item.Name));
-                    await _media.DownloadAsync(item.Path, localPath, CancellationToken.None);
+                    await service.DownloadAsync(item.Path, localPath, CancellationToken.None, progress, item.Size);
                     success++;
                 }
                 catch (Exception exception) { failures.Add($"{item.Name}: {exception.Message}"); }
@@ -286,10 +300,12 @@ public partial class MediaWindow : Window
             await _audit.WriteAsync("media-download-batch", $"{success}/{selected.Count} 成功; {string.Join(";", failures.Take(3))}");
         }
         catch (Exception exception) { StatusText.Text = $"下载失败：{exception.Message}（已完成 {success}/{selected.Count}）。"; }
+        finally { EndDownload(); }
     }
 
     private void ChangeDownloadFolder_Click(object sender, RoutedEventArgs e)
     {
+        if (_downloading) return;
         var dialog = new Microsoft.Win32.OpenFolderDialog
         {
             Title = "选择下载目录",
@@ -304,6 +320,50 @@ public partial class MediaWindow : Window
             StatusText.Text = $"下载目录已更改为：{_downloadFolder}";
         }
     }
+
+    private sealed class MediaProgress(Action<TransferProgress> report) : IProgress<TransferProgress>
+    {
+        public void Report(TransferProgress value) => report(value);
+    }
+
+    private IProgress<TransferProgress> BeginDownload(IReadOnlyList<MediaItem> items)
+    {
+        _downloading = true;
+        DownloadButton.IsEnabled = false;
+        TypeSelector.IsEnabled = BucketSelector.IsEnabled = DevicesList.IsEnabled = false;
+        var total = items.Any(item => item.Size is null) ? -1 : checked(items.Sum(item => item.Size!.Value) * 2);
+        _progressTracker.Reset(total);
+        TransferPanel.Visibility = Visibility.Visible;
+        DownloadProgress.Value = 0;
+        DownloadProgress.IsIndeterminate = total < 0;
+        ProgressInfoText.Text = "准备下载…";
+        var done = new HashSet<string>();
+        return new MediaProgress(value =>
+        {
+            if (!_downloading) return;
+            if (value.State == "done") done.Add(value.TransferId);
+            _progressTracker.Update(value);
+            DownloadProgress.IsIndeterminate = total < 0 || value.TotalBytes < 0;
+            DownloadProgress.Value = _progressTracker.Percent;
+            var percent = DownloadProgress.IsIndeterminate ? "大小读取中" : $"{_progressTracker.Percent:0.#}%";
+            ProgressInfoText.Text = $"完成 {done.Count}/{items.Count} · {value.FileName} · {value.Stage} · {percent}\n"
+                + $"等效进度 {FormatBytes(_progressTracker.DoneActualBytes)} / {(total < 0 ? "未知" : FormatBytes(total / 2))}"
+                + (DownloadProgress.IsIndeterminate ? "" : $" · {_progressTracker.SpeedText} · {_progressTracker.EtaText}");
+        });
+    }
+
+    private void EndDownload()
+    {
+        _downloading = false;
+        DownloadButton.IsEnabled = _media != null;
+        TypeSelector.IsEnabled = BucketSelector.IsEnabled = DevicesList.IsEnabled = true;
+        DownloadProgress.IsIndeterminate = false;
+    }
+
+    private static string FormatBytes(long bytes) => bytes >= 1024L * 1024 * 1024
+        ? $"{bytes / (1024d * 1024 * 1024):0.##} GB"
+        : bytes >= 1024 * 1024 ? $"{bytes / (1024d * 1024):0.##} MB"
+        : bytes >= 1024 ? $"{bytes / 1024d:0.##} KB" : $"{bytes} B";
 
     // ---------- 面包屑 ----------
 
@@ -350,6 +410,7 @@ public partial class MediaWindow : Window
 
     private async Task AutoRefreshAsync()
     {
+        if (_downloading) return;
         if (_refreshing) return;
         _refreshing = true;
         try

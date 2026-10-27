@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO;
 using System.Text.RegularExpressions;
 using HarmonyFileManager.Models;
 
@@ -48,19 +49,68 @@ public sealed class MediaService
 
     /// <summary>下载单个媒体文件:mediatool recv 到设备临时目录 → hdc file recv 回本机。
     /// 大文件由 hdc file recv 的 300s 超时覆盖。</summary>
-    public async Task DownloadAsync(string remoteMediaPath, string localPath, CancellationToken cancellationToken)
+    public async Task DownloadAsync(string remoteMediaPath, string localPath, CancellationToken cancellationToken,
+        IProgress<TransferProgress>? progress = null, long? expectedSize = null)
     {
         var temp = $"/data/local/tmp/hfm_media_{Guid.NewGuid():N}.tmp";
+        var staging = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(localPath))!, $".hfm_{Guid.NewGuid():N}.partial");
+        var id = Guid.NewGuid().ToString("N");
+        var total = expectedSize is >= 0 ? checked(expectedSize.Value * 2) : -1;
+        void Report(long bytes, string stage, bool measured = true, string state = "running") => progress?.Report(new TransferProgress
+        {
+            TransferId = id, Direction = "download", FileName = remoteMediaPath[(remoteMediaPath.LastIndexOf('/') + 1)..],
+            BytesTransferred = total >= 0 ? Math.Clamp(bytes, 0, total) : Math.Max(0, bytes),
+            TotalBytes = measured ? total : -1, Stage = stage, State = state
+        });
+        async Task MonitorAsync(Task transfer, Func<Task<long>> size, long offset, string stage)
+        {
+            Report(offset, stage, false);
+            while (!transfer.IsCompleted)
+            {
+                var bytes = -1L;
+                try { bytes = await size(); }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+                catch { /* 监测失败不能影响传输任务本身。 */ }
+                Report(offset + Math.Max(0, bytes), stage, bytes >= 0);
+                await Task.WhenAny(transfer, Task.Delay(250));
+            }
+            await transfer;
+        }
         try
         {
-            await _hdc.RunShellAsync(_deviceId, $"mediatool recv {Quote(remoteMediaPath)} {Quote(temp)}", cancellationToken);
-            await _hdc.ReceiveFileAsync(_deviceId, temp, localPath, cancellationToken);
+            var receive = _hdc.RunShellAsync(_deviceId, $"mediatool recv {Quote(remoteMediaPath)} {Quote(temp)}", cancellationToken, 300);
+            await MonitorAsync(receive, () => GetTemporarySizeAsync(temp, cancellationToken), 0, "读取媒体到设备临时目录");
+            var stagedSize = await GetTemporarySizeAsync(temp, cancellationToken);
+            if (stagedSize < 0 || (expectedSize is >= 0 && stagedSize != expectedSize))
+                throw new IOException("媒体临时文件大小无法确认或不完整。");
+            total = checked(stagedSize * 2);
+            var download = _hdc.ReceiveFileAsync(_deviceId, temp, staging, cancellationToken);
+            await MonitorAsync(download, () => Task.FromResult(File.Exists(staging) ? new FileInfo(staging).Length : 0L), stagedSize, "下载到本机");
+            if (new FileInfo(staging).Length != stagedSize) throw new IOException("媒体下载不完整。");
+            File.Move(staging, localPath, overwrite: true);
             await _audit.WriteAsync("media-download", $"{remoteMediaPath} -> {localPath}");
+            Report(total, "完成", true, "done");
+        }
+        catch (Exception exception)
+        {
+            Report(0, "失败", false, "failed");
+            await _audit.WriteAsync("media-download-failed", $"{remoteMediaPath}: {exception.Message}");
+            throw;
         }
         finally
         {
+            try { if (File.Exists(staging)) File.Delete(staging); } catch { /* 尽力清理。 */ }
             try { await _hdc.RunShellAsync(_deviceId, $"rm -f {Quote(temp)}", CancellationToken.None, 5); } catch { /* 清理失败忽略 */ }
         }
+    }
+
+    private async Task<long> GetTemporarySizeAsync(string path, CancellationToken cancellationToken)
+    {
+        var output = await _hdc.RunShellAsync(_deviceId,
+            $"stat -c %s {Quote(path)} 2>/dev/null || wc -c < {Quote(path)}", cancellationToken, 5);
+        var line = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim();
+        if (line?.StartsWith("--", StringComparison.Ordinal) == true) line = line[2..].Trim();
+        return long.TryParse(line, NumberStyles.Integer, CultureInfo.InvariantCulture, out var size) && size >= 0 ? size : -1;
     }
 
     private static IReadOnlyList<MediaItem> ParseListing(string output, string remoteDir)
